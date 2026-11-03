@@ -25,10 +25,10 @@ export const demoIncident = {
 }
 
 export const priorityLevels: { name: Priority; color: string; radiusMeters: number }[] = [
-  { name: 'Critical', color: '#fb5d5d', radiusMeters: 630 },
-  { name: 'High', color: '#ff9f43', radiusMeters: 560 },
-  { name: 'Medium', color: '#f3c969', radiusMeters: 470 },
-  { name: 'Low', color: '#5bc99b', radiusMeters: 410 },
+  { name: 'Critical', color: '#EF5350', radiusMeters: 630 },
+  { name: 'High', color: '#FF9F43', radiusMeters: 560 },
+  { name: 'Medium', color: '#F5C451', radiusMeters: 470 },
+  { name: 'Low', color: '#32C99A', radiusMeters: 410 },
 ]
 
 export const areas: Area[] = [

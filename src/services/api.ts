@@ -5,9 +5,21 @@ export type RequestRecord = { id: number; request_id: string; area_id: string; a
 export type AlertRecord = { id: number; alert_id: string; severity: string; title: string; message: string; area_id: string | null; is_read: boolean; timestamp: string }
 export type OptimizationRun = { id: number; status: string; fitness: number; generations: number; parameters: Record<string, number>; created_at: string }
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000/api'
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api'
 const TOKEN_KEY = 'resqai.access_token'
 const USER_KEY = 'resqai.user'
+
+async function fetchApi(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (error) {
+    if (error instanceof TypeError) {
+      const origin = typeof window === 'undefined' ? 'the frontend origin' : window.location.origin
+      throw new Error(`Cannot reach the Sahaaya API at ${API_BASE}. Start the FastAPI backend and allow ${origin} in CORS.`)
+    }
+    throw error
+  }
+}
 
 function responseError(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== 'object') return fallback
@@ -38,7 +50,7 @@ export function getSessionUser(): User | null {
 }
 export function clearSession() { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY) }
 export async function login(email: string, password: string): Promise<User> {
-  const response = await fetch(`${API_BASE}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) })
+  const response = await fetchApi(`${API_BASE}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) })
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(responseError(payload, 'Unable to sign in. Check that the Sahaaya API is running.'))
   localStorage.setItem(TOKEN_KEY, payload.access_token)
@@ -47,7 +59,7 @@ export async function login(email: string, password: string): Promise<User> {
 }
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem(TOKEN_KEY)
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers: { ...(init.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...init.headers } })
+  const response = await fetchApi(`${API_BASE}${path}`, { ...init, headers: { ...(init.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...init.headers } })
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}))
     throw new Error(responseError(payload, `Request failed (${response.status})`))
@@ -59,7 +71,7 @@ export function downloadCsv(path: string, filename: string) {
   return apiBlob(path).then(blob => { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = filename; anchor.click(); URL.revokeObjectURL(url) })
 }
 async function apiBlob(path: string) {
-  const response = await fetch(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${localStorage.getItem(TOKEN_KEY) ?? ''}` } })
+  const response = await fetchApi(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${localStorage.getItem(TOKEN_KEY) ?? ''}` } })
   if (!response.ok) throw new Error('The report could not be generated.')
   return response.blob()
 }

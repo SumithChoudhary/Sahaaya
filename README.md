@@ -21,6 +21,10 @@ Sahaaya is the official project name. Its full title is **Smart Disaster Resourc
 
 All bundled scenario data and coordinates are fictional. Use the prototype only for software evaluation and demonstration.
 
+## Brand identity
+
+The official visual identity is **Sahaaya + FlowShield**. FlowShield is a flowing S-shaped ribbon mark using electric blue, cyan, and lime on the Command Dark interface. The reusable React component is `src/components/FlowShieldLogo.tsx`. Vector variants are in `public/assets/`: `flowshield-symbol.svg`, `sahaaya-flowshield-dark.svg`, `sahaaya-flowshield-light.svg`, `sahaaya-flowshield-mono.svg`, and `flowshield-app-icon.svg` (the browser favicon).
+
 ## Architecture
 
 ```text
@@ -34,7 +38,7 @@ backend/app/                 FastAPI application and SQLAlchemy models
   migrations/                Alembic migration environment and initial schema
 ```
 
-The frontend and backend are intentionally separate. The browser uses `VITE_API_BASE_URL` (default `http://127.0.0.1:8000/api`). The backend reads configuration from environment variables or `backend/.env`.
+The frontend and backend are intentionally separate. In local development the browser uses `/api`, which Vite proxies to `http://127.0.0.1:8000` to avoid local CORS issues. Set `VITE_API_BASE_URL` when the frontend and backend are hosted on different origins. The backend reads configuration from environment variables or `backend/.env`.
 
 ## Requirements
 
@@ -51,14 +55,14 @@ npm install
 npm run dev
 ```
 
-Vite serves the interface at `http://localhost:5173`. For a production bundle:
+Vite serves the interface at `http://localhost:5173` (or `5174` if `5173` is already occupied). Both local origins are allowed by the example backend CORS configuration. Restart the API after changing `CORS_ORIGINS`. For a production bundle:
 
 ```bash
 npm run build
 npm run preview
 ```
 
-Set `VITE_API_BASE_URL` in a root `.env` file to override the API URL. Keep it pointed at the local backend during demo use.
+Set `VITE_API_BASE_URL` in a root `.env` file to override the API base path or URL. Leave it unset for local Vite development, which uses the `/api` proxy.
 
 ## Backend and database
 
