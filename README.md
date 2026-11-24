@@ -17,13 +17,14 @@ Sahaaya is the official project name. Its full title is **Smart Disaster Resourc
 - Transparent demand estimation heuristics that report demand separately from available supply and unmet demand.
 - Inspectable custom Genetic Algorithm with per-resource supply constraints, elitism, selection, crossover, mutation, response-cost weighting, fitness history, and configurable parameters.
 - Optimization results are saved as pending review. Officers can approve, modify, or reject per-area recommendations; rejection requires a reason. Approval records manual deployment allocations. No automatic dispatch or live GPS tracking exists.
+- Officers can submit operator-authored alerts across geological, hydrological, meteorological, climatological, biological, technological, and other hazards. The app records in-app notifications for all department inboxes and creates category-based response tasks. These are coordination records only: the app does not contact departments, send SMS/push messages, verify reports, or dispatch responders.
 - Analytics, what-if simulations, alert acknowledgement, audit history, settings, and CSV exports are backed by API data.
 
 All bundled scenario data and coordinates are fictional. Use the prototype only for software evaluation and demonstration.
 
 ## Brand identity
 
-The official visual identity is **Sahaaya + FlowShield**. FlowShield is a flowing S-shaped ribbon mark using electric blue, cyan, and lime on the Command Dark interface. The reusable React component is `src/components/FlowShieldLogo.tsx`. Vector variants are in `public/assets/`: `flowshield-symbol.svg`, `sahaaya-flowshield-dark.svg`, `sahaaya-flowshield-light.svg`, `sahaaya-flowshield-mono.svg`, and `flowshield-app-icon.svg` (the browser favicon).
+The official visual identity uses the supplied Sahaaya shield-and-rescue logo. The reusable React component is `src/components/FlowShieldLogo.tsx`. Optimized transparent WebP versions for the full logo and emblem, plus a PNG browser icon, are in `public/assets/` as `sahaaya-logo.webp`, `sahaaya-emblem.webp`, and `sahaaya-app-icon.png`. High-resolution PNG logo and emblem files are available alongside them.
 
 ## Architecture
 
@@ -52,10 +53,10 @@ From the project root:
 
 ```bash
 npm install
-npm run dev
+npm run dev:all
 ```
 
-Vite serves the interface at `http://localhost:5173` (or `5174` if `5173` is already occupied). Both local origins are allowed by the example backend CORS configuration. Restart the API after changing `CORS_ORIGINS`. For a production bundle:
+`npm run dev:all` starts the FastAPI backend and Vite frontend together. Open `http://localhost:5173` (Vite uses `5174` if `5173` is already occupied). The frontend's `/api` requests are proxied to the backend at `http://127.0.0.1:8000`. Press `Ctrl+C` once to stop both services. For a production bundle:
 
 ```bash
 npm run build
@@ -66,7 +67,7 @@ Set `VITE_API_BASE_URL` in a root `.env` file to override the API base path or U
 
 ## Backend and database
 
-Create and activate a virtual environment, then install the dependencies:
+If you use `npm run dev:all`, it automatically selects the project `.venv` Python when available (otherwise it uses `python` on Windows or `python3` on macOS/Linux). Create the environment and install the dependencies first:
 
 ```bash
 python -m venv .venv
@@ -149,6 +150,8 @@ Key endpoints (authenticated endpoints require `Authorization: Bearer <token>`):
 | POST | `/api/optimization/{id}/reject?area_id=...` | Reject with a required reason |
 | GET/PATCH | `/api/deployments` | Review/update manual deployment records |
 | GET/PATCH | `/api/alerts` | List and acknowledge alerts |
+| GET/POST | `/api/disaster-alerts` | Review or create operator-reported disaster alerts and in-app department notifications/tasks |
+| PATCH | `/api/disaster-alerts/tasks/{task_id}` | Update a department response task status |
 | GET | `/api/analytics/overview` | Aggregated demo metrics and charts |
 | POST | `/api/simulation/run` | Compare baseline and simulated scenario |
 | GET | `/api/history` | Audit timeline |
@@ -156,9 +159,69 @@ Key endpoints (authenticated endpoints require `Authorization: Bearer <token>`):
 
 ## Known limitations
 
-- No real incident feeds, disaster victims, dispatch integrations, or device/IoT dependencies are used.
+- Provider connectors and storage are implemented, but external services do not become connected until required authorization/configuration is supplied and a successful ingestion is recorded. No real disaster feed was imported during this implementation.
 - The model uses synthetic labels. The demand rules and travel-distance cost are approximations and have not been field validated.
+- The GA enforces resource stock constraints per resource center and estimates response cost using straight-line distance from a center to an area. It does not yet optimize road-network travel time or multi-stop routing.
 - Demo map coordinates are illustrative and use OpenStreetMap tiles when the browser has internet access; the map is not live tracking.
 - JWT/HMAC auth is a prototype. There is no password reset, account management UI, refresh-token flow, rate limiting, or production security review.
 - SQLite is suitable for local development only. PostgreSQL is supported through SQLAlchemy but needs a provisioned database and deployment configuration.
-- PDF/Excel reporting, paging at the API level, automated alert generation, richer center/resource CRUD, and production ML evaluation remain future work.
+- The historical import supports CSV/JSON with explicit mapping, provenance and validation; it does not perform automatic unit conversions or silently harmonize geographic resolution.
+- PostGIS boundaries, external population exposure datasets, verified impact labels, and production ML evaluation remain future work.
+
+## Real-data integration
+
+The integration layer is under `backend/app/integrations/`. It stores source records and content hashes in `raw_source_records`, normalizes supported observations/incidents into separate tables, and records every attempt in `ingestion_logs`. API-triggered ingestion is available to Emergency Officers and Administrators. A per-source database lease prevents concurrent manual/scheduled fetches. Set `SAHAAYA_INGESTION_ENABLED=true` to start the opt-in scheduler; `SAHAAYA_INGESTION_INTERVAL_SECONDS` controls its interval (minimum 60 seconds). Keep scheduling disabled until source terms and polling cadence are reviewed.
+
+Configure sources in the authenticated **Data Sources** page when an Administrator account is used. The NWIC and CWC forms accept HTTPS URLs on the reviewed provider hosts only. The NWIC resource also needs an explicit JSON column mapping before rainfall rows are normalized. Unmapped rows remain stored as raw records. IMD credentials/endpoints and the subscribed SACHET feed URL are server-side environment variables only. The app never asks for or sends these secrets to the browser.
+
+| Provider | Connector behavior | Configuration state / limitation |
+|---|---|---|
+| USGS | Parses the official all-day GeoJSON earthquake feed, including event ID, magnitude/depth in the raw record, coordinates, event/update timestamps and source URL. | Public feed URL is configured; no successful external connection is implied until source health shows a successful fetch. Historical FDSN querying is not yet exposed as a scheduled connector. |
+| GDACS | Fetches recent earthquake, flood and tropical cyclone event list; stores provider IDs, geometries and links. | Public endpoint configured; attribution and source terms apply. |
+| NWIC / Telangana SW | Fetches a configured CSV resource; exact mappings create rainfall observations with station and optional state/district hierarchy. Future timestamps are rejected. | Public dataset URL can be configured, but schema mapping must match the selected resource. The portal offers separate 2021–2025 and 2026–2030 CSV resources; future-dated rows in the latter are not accepted as observations. |
+| NDMA SACHET | Parses subscribed CAP XML, including issuer, event, severity, urgency, certainty, effective/expiry, description, instructions and affected area. Uses ETag/304 support and rejects XML entity declarations. | Not configured until the account-specific feed identifier/URL from SACHET subscription is supplied. |
+| IMD | Configurable documented endpoint set and field normalization for current weather fields, with raw provider payload retained. | Not configured until authorized endpoints and the exact account-issued auth headers are supplied. The application does not guess credentials or auth format. |
+| CWC | Configurable HTTPS source fetch and raw CSV/JSON preservation. | No public API path is assumed. Configure only a verified authorized feed; normalized forecast schema mapping is not implemented. |
+
+The NWIC source’s public resource page documents hourly Telangana SW rainfall telemetry and both historical and forward resource ranges: [National Water Data Portal dataset](https://nwdp.nwic.gov.in/dataset/rainfall-telemetry-hourly-telangana-sw). A future range is a dataset label, not proof that every row is an observation; Sahaaya validates each record timestamp before storing it as measured rainfall.
+
+### Historical dataset import
+
+1. Sign in and open **Historical Data**.
+2. Choose a UTF-8 CSV or JSON file (maximum 12 MB).
+3. Enter exact source columns for timestamp, numeric value, variable, and unit. Add the source record ID, hazard, station/location, coordinates, and state/district names or codes when available.
+4. Add dataset/resource ID, publisher, license/terms and coverage dates.
+5. Preview validation errors and valid rows before importing. Future timestamps and invalid coordinates are rejected; values with unspecified/ambiguous units should not be imported as a normalized measurement.
+6. Re-importing identical rows is deduplicated. Changed source rows are retained as raw revisions and update the normalized observation for that time and variable.
+
+Historical observations are stored separately from current observations and incidents. API queries support paging, time range, state and district filters. Example v1 endpoints include `GET /api/v1/historical/rainfall`, `GET /api/v1/historical/disasters`, `GET /api/v1/observations/rainfall`, and `GET /api/v1/map/layers`. Review exact query parameters in `/docs`.
+
+### Integration API and source health
+
+Authenticated v1 endpoints include:
+
+- `GET /api/v1/sources` and `GET /api/v1/sources/status`
+- `GET /api/v1/ingestion/logs?page=1&page_size=25`
+- `POST /api/v1/sources/{source_key}/ingest`
+- `GET /api/v1/alerts`, `GET /api/v1/incidents`
+- `GET /api/v1/observations/weather`, `/rainfall`, and `/rivers`
+- `GET /api/v1/dashboard/summary`, `/analytics/hazards`, and `/map/layers`
+- `POST /api/v1/historical/import/preview` and `POST /api/v1/historical/import` (multipart form)
+- `POST /api/v1/alerts/{id}/review`
+- `POST /api/v1/optimization/run` and `POST /api/v1/optimization/{id}/approve`
+
+Source freshness is based on each provider's last successful fetch and freshness threshold. The frontend's own refresh does not mark a provider live. Failed integrated map queries show an error or an empty state; synthetic preview locations require selecting **Demo preview** explicitly.
+
+### Test commands
+
+Run the backend unit and migration tests from the project root:
+
+```bash
+python -m unittest discover -s backend/tests -v
+```
+
+The tests use mocked provider payloads, temporary SQLite databases, and a legacy-row migration check. They do not make calls to external providers. Run the frontend type check and production build with:
+
+```bash
+npm run build
+```

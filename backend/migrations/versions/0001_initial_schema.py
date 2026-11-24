@@ -15,4 +15,4 @@ def upgrade():
 
 
 def downgrade():
-    Base.metadata.drop_all(bind=op.get_bind())
+    raise RuntimeError("The original Sahaaya schema migration is intentionally non-destructive; restore from an approved backup or create a reviewed forward migration.")

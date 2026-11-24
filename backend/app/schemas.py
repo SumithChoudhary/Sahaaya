@@ -157,6 +157,19 @@ class AlertUpdate(BaseModel):
     is_read: bool
 
 
+class DisasterAlertCreate(BaseModel):
+    hazard_category: Literal["Geological", "Hydrological", "Meteorological", "Climatological", "Biological", "Technological", "Other"]
+    hazard_type: str = Field(min_length=2, max_length=80)
+    title: str = Field(min_length=4, max_length=160)
+    description: str = Field(min_length=10, max_length=2000)
+    location: str = Field(min_length=2, max_length=200)
+    severity: Literal["Critical", "High", "Medium", "Low"]
+
+
+class ResponseTaskUpdate(BaseModel):
+    status: Literal["Assigned", "Acknowledged", "In progress", "Completed"]
+
+
 class UserOut(ORMModel):
     id: int
     name: str

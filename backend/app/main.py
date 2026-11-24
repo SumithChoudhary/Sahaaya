@@ -4,30 +4,38 @@ import csv
 import io
 import os
 import secrets
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import Base, SessionLocal, engine, get_db
+from .db import SessionLocal, get_db
 from .models import (
     AffectedArea, Alert, AppSetting, AuditEvent, Decision, Deployment, Disaster,
-    EmergencyRequest, OptimizationRun, Resource, ResourceCenter, SimulationRun, User,
+    DepartmentNotification, EmergencyRequest, OptimizationRun, Resource, ResourceCenter,
+    ResourceInventory, ResponseTask, SimulationRun, User, UserDisasterAlert,
 )
 from .schemas import (
-    AlertUpdate, AllocationChange, AreaCreate, AreaUpdate, CenterInput,
+    AlertUpdate, AllocationChange, AreaCreate, AreaUpdate, CenterInput, DisasterAlertCreate,
     DeploymentUpdate, GAParameters, LoginRequest, OptimizationInput,
-    RejectInput, RequestInput, RequestUpdate, ResourceInput, ResourceUpdate,
+    RejectInput, RequestInput, RequestUpdate, ResourceInput, ResourceUpdate, ResponseTaskUpdate,
     ScenarioInput, SettingsInput, TokenOut,
 )
 from .security import create_access_token, current_user, hash_password, require_roles, verify_password
 from .services.demand import demand_table, estimate_area_demand
 from .services.optimizer import optimize
 from .services.priority import predict_priority
+from .integrations.registry import ensure_source_catalog
+from .services.scheduler import ingestion_scheduler
+from .api_v1 import router as api_v1_router
 
 
 def log_event(db: Session, category: str, summary: str, details: dict | None = None, user_id: int | None = None) -> None:
@@ -36,6 +44,87 @@ def log_event(db: Session, category: str, summary: str, details: dict | None = N
 
 def add_alert(db: Session, severity: str, title: str, message: str, area_id: str | None = None) -> None:
     db.add(Alert(alert_id=f"AL-{secrets.token_hex(4).upper()}", severity=severity, title=title, message=message, area_id=area_id, is_read=False))
+
+
+DEPARTMENTS = (
+    "Emergency Management", "Fire & Rescue", "Police", "Medical & EMS",
+    "Public Works", "Utilities", "Environment & Forestry", "Water Resources",
+    "Meteorological Services", "Shelter & Relief",
+)
+
+TASKS_BY_CATEGORY = {
+    "Geological": {
+        "Emergency Management": "Coordinate the incident picture and review incoming field updates.",
+        "Fire & Rescue": "Review access and prepare a search and rescue assessment.",
+        "Police": "Review public safety perimeter and evacuation needs.",
+        "Medical & EMS": "Review triage capacity and medical access requirements.",
+        "Public Works": "Assess reported infrastructure and route access impacts.",
+    },
+    "Hydrological": {
+        "Emergency Management": "Coordinate water level reports and review affected locations.",
+        "Fire & Rescue": "Review water rescue readiness and safe access conditions.",
+        "Police": "Review evacuation routes and public access controls.",
+        "Medical & EMS": "Review medical access and support needs for affected people.",
+        "Public Works": "Review drainage, roads, bridges, and infrastructure impacts.",
+        "Water Resources": "Review local water level and flow reports.",
+        "Shelter & Relief": "Review temporary shelter and essential supply capacity.",
+    },
+    "Meteorological": {
+        "Emergency Management": "Monitor the reported hazard and coordinate situation updates.",
+        "Fire & Rescue": "Review readiness and safe operating conditions.",
+        "Police": "Review public advisories, access, and evacuation support needs.",
+        "Medical & EMS": "Review service readiness and vulnerable population support.",
+        "Utilities": "Review potential impacts to power and communications infrastructure.",
+        "Meteorological Services": "Review the report against available local weather observations.",
+        "Shelter & Relief": "Review shelter readiness and essential supplies.",
+    },
+    "Climatological": {
+        "Emergency Management": "Coordinate the incident picture and review field updates.",
+        "Fire & Rescue": "Review fire behavior, access, and response readiness as applicable.",
+        "Police": "Review public safety, access, and evacuation support needs.",
+        "Medical & EMS": "Review heat, smoke, or other exposure related medical needs.",
+        "Public Works": "Review roads and critical infrastructure for reported impacts.",
+        "Environment & Forestry": "Review environmental and forest impact reports.",
+        "Utilities": "Review potential impacts to power and communications infrastructure.",
+        "Shelter & Relief": "Review cooling, shelter, and essential supply capacity.",
+    },
+    "Biological": {
+        "Emergency Management": "Coordinate verified situation updates and response planning.",
+        "Medical & EMS": "Review health service capacity and care requirements.",
+        "Police": "Review public safety and access support needs.",
+        "Water Resources": "Review water safety concerns where relevant.",
+        "Shelter & Relief": "Review safe shelter and essential supply requirements.",
+    },
+    "Technological": {
+        "Emergency Management": "Coordinate the incident picture and review field updates.",
+        "Fire & Rescue": "Review rescue access and incident safety requirements.",
+        "Police": "Review perimeter, traffic, and public safety needs.",
+        "Medical & EMS": "Review triage and medical response needs.",
+        "Public Works": "Review structural and transport infrastructure impacts.",
+        "Utilities": "Review potential utility service impacts and isolation needs.",
+        "Environment & Forestry": "Review potential environmental contamination concerns.",
+    },
+    "Other": {
+        "Emergency Management": "Coordinate the incident picture and review field updates.",
+        "Fire & Rescue": "Review rescue and incident safety requirements.",
+        "Police": "Review public safety and access support needs.",
+        "Medical & EMS": "Review medical support requirements.",
+        "Public Works": "Review access and infrastructure impacts.",
+    },
+}
+
+
+def user_disaster_alert_payload(db: Session, item: UserDisasterAlert) -> dict:
+    notifications = db.scalars(select(DepartmentNotification).where(DepartmentNotification.alert_id == item.id).order_by(DepartmentNotification.id)).all()
+    tasks = db.scalars(select(ResponseTask).where(ResponseTask.alert_id == item.id).order_by(ResponseTask.id)).all()
+    return {
+        "id": item.id, "alert_key": item.alert_key, "hazard_category": item.hazard_category,
+        "hazard_type": item.hazard_type, "title": item.title, "description": item.description,
+        "location": item.location, "severity": item.severity, "status": item.status,
+        "created_by": item.created_by, "timestamp": item.timestamp,
+        "notified_departments": [{"department": row.department, "is_read": row.is_read} for row in notifications],
+        "tasks": [{"id": row.id, "department": row.department, "task": row.task, "status": row.status} for row in tasks],
+    }
 
 
 def area_payload(area: AffectedArea) -> dict:
@@ -122,18 +211,47 @@ def _seed_if_empty(db: Session) -> None:
     db.commit()
 
 
+def _seed_center_inventory_ledger(db: Session) -> None:
+    """Backfill center stock once from legacy inventory rows without changing them."""
+    if (db.scalar(select(func.count(ResourceInventory.id))) or 0) > 0:
+        return
+    legacy_rows = db.scalars(select(Resource).where(Resource.center_id.is_not(None))).all()
+    for item in legacy_rows:
+        db.add(ResourceInventory(center_id=item.center_id, resource_key=item.resource_key, name=item.name,
+            total=item.total, available=item.available, allocated=item.allocated, deployed=item.deployed,
+            unit=item.unit, quality_status="demo_seed"))
+    db.commit()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    project_root = Path(__file__).resolve().parents[2]
+    alembic_config = Config(str(project_root / "backend" / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(project_root / "backend" / "migrations"))
+    command.upgrade(alembic_config, "head")
     with SessionLocal() as db:
         _migrate_legacy_demo_identity(db)
         _seed_if_empty(db)
-    yield
+        _seed_center_inventory_ledger(db)
+        ensure_source_catalog(db)
+    scheduler_task = None
+    if os.getenv("SAHAAYA_INGESTION_ENABLED", "false").lower() in {"1", "true", "yes"}:
+        scheduler_task = asyncio.create_task(ingestion_scheduler())
+    try:
+        yield
+    finally:
+        if scheduler_task:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Sahaaya Decision Support API", version="1.0.0", description="Human-reviewed disaster resource decision support. Demo inputs are fictional; no automatic dispatch.", lifespan=lifespan)
 origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(api_v1_router)
 
 
 @app.get("/api/health")
@@ -283,6 +401,8 @@ def create_resource(payload: ResourceInput, db: Session = Depends(get_db), user:
         raise HTTPException(status_code=422, detail="Available, allocated, and deployed quantities cannot exceed total")
     item = Resource(**payload.model_dump())
     db.add(item)
+    db.flush()
+    _sync_resource_inventory_from_legacy(db, item)
     log_event(db, "resource.created", f"Added resource {payload.name}", {"resource_key": payload.resource_key}, user.id)
     db.commit()
     db.refresh(item)
@@ -294,19 +414,46 @@ def update_resource(resource_key: str, payload: ResourceUpdate, db: Session = De
     item = db.scalar(select(Resource).where(Resource.resource_key == resource_key))
     if item is None:
         raise HTTPException(status_code=404, detail="Resource not found")
+    if item.center_id is None and db.scalar(select(ResourceInventory.id).where(ResourceInventory.resource_key == resource_key)):
+        raise HTTPException(status_code=409, detail="This is an aggregate across multiple centers. Update stock from the Resource Centers inventory view.")
     values = payload.model_dump(exclude_unset=True)
     quantities = {key: values.get(key, getattr(item, key)) for key in ("total", "available", "allocated", "deployed")}
     if quantities["available"] + quantities["allocated"] + quantities["deployed"] > quantities["total"]:
         raise HTTPException(status_code=422, detail="Available, allocated, and deployed quantities cannot exceed total")
     previous_available = item.available
+    previous_center_id = item.center_id
     for key, value in values.items():
         setattr(item, key, value)
+    _sync_resource_inventory_from_legacy(db, item, previous_center_id)
     if item.available < previous_available and item.total > 0 and item.available / item.total < 0.6:
         add_alert(db, "Warning", "Resource shortage threshold", f"{item.name} availability is below 60% of demo inventory.")
     log_event(db, "resource.updated", f"Updated resource {item.name}", {"resource_key": item.resource_key, "changed": list(values)}, user.id)
     db.commit()
     db.refresh(item)
     return resource_payload(item)
+
+
+def _sync_resource_inventory_from_legacy(db: Session, item: Resource, previous_center_id: int | None = None) -> None:
+    """Keep center-level ledger aligned with legacy one-center resource edits."""
+    center_ids = {center_id for center_id in (previous_center_id, item.center_id) if center_id is not None}
+    if not center_ids:
+        return
+    rows = db.scalars(select(ResourceInventory).where(ResourceInventory.resource_key == item.resource_key,
+        ResourceInventory.center_id.in_(center_ids))).all()
+    for inventory in rows:
+        if inventory.center_id != item.center_id:
+            db.delete(inventory)
+    if item.center_id is not None:
+        inventory = next((row for row in rows if row.center_id == item.center_id), None)
+        if inventory is None:
+            inventory = ResourceInventory(center_id=item.center_id, resource_key=item.resource_key, name=item.name,
+                total=item.total, available=item.available, allocated=item.allocated, deployed=item.deployed,
+                unit=item.unit, quality_status="manual_update")
+            db.add(inventory)
+        else:
+            for key in ("name", "total", "available", "allocated", "deployed", "unit"):
+                setattr(inventory, key, getattr(item, key))
+            inventory.quality_status = "manual_update"
 
 
 @app.get("/api/resource-centers")
@@ -408,11 +555,52 @@ def _optimization_inputs(db: Session, area_ids: list[str] | None):
     if not area_objects:
         raise HTTPException(status_code=422, detail="No affected areas selected")
     areas = [area_payload(area) for area in area_objects]
-    resource_objects = db.scalars(select(Resource)).all()
+    inventory_rows = db.scalars(select(ResourceInventory).order_by(ResourceInventory.id)).all()
+    inventory_keys = {item.resource_key for item in inventory_rows}
+    resource_objects = list(inventory_rows)
+    resource_objects.extend(item for item in db.scalars(select(Resource)).all() if item.resource_key not in inventory_keys)
     resources = [{"resource_key": item.resource_key, "available": item.available, "total": item.total} for item in resource_objects]
     centers = [{"id": item.id, "latitude": item.latitude, "longitude": item.longitude} for item in db.scalars(select(ResourceCenter)).all()]
     demands = demand_table(areas, resources)
     return area_objects, areas, resource_objects, centers, demands
+
+
+def _available_resource_supply(db: Session) -> dict[str, int]:
+    inventory_rows = db.scalars(select(ResourceInventory)).all()
+    by_key: dict[str, int] = {}
+    inventory_keys = set()
+    for item in inventory_rows:
+        inventory_keys.add(item.resource_key)
+        by_key[item.resource_key] = by_key.get(item.resource_key, 0) + item.available
+    for item in db.scalars(select(Resource)).all():
+        if item.resource_key not in inventory_keys:
+            by_key[item.resource_key] = item.available
+    return by_key
+
+
+def _center_allocation(db: Session, area: AffectedArea, resource_key: str, count: int) -> dict[str, int]:
+    """Spread a human-edited quantity across currently available center stock."""
+    remaining = count
+    rows = db.scalars(select(ResourceInventory).where(ResourceInventory.resource_key == resource_key,
+        ResourceInventory.available > 0)).all()
+    rows.sort(key=lambda item: haversine_km(area.latitude, area.longitude, item.center.latitude, item.center.longitude))
+    distribution: dict[str, int] = {}
+    for item in rows:
+        take = min(item.available, remaining)
+        if take:
+            distribution[str(item.center_id)] = take
+            remaining -= take
+        if not remaining:
+            break
+    inventory_keys = db.scalars(select(ResourceInventory.resource_key).distinct()).all()
+    if remaining and resource_key not in inventory_keys:
+        legacy = db.scalar(select(Resource).where(Resource.resource_key == resource_key))
+        if legacy and legacy.available >= remaining:
+            distribution[str(legacy.center_id) if legacy.center_id is not None else "unassigned"] = remaining
+            remaining = 0
+    if remaining:
+        raise HTTPException(status_code=422, detail=f"Only {count - remaining} units of {resource_key} are available across centers")
+    return distribution
 
 
 @app.post("/api/optimization/run", status_code=201)
@@ -453,10 +641,12 @@ def _review(run_id: int, area_id: str, action: str, reason: str | None, allocati
     row = next((item for item in run.results.get("results", []) if item["area_id"] == area_id), None)
     if row is None:
         raise HTTPException(status_code=404, detail="Area is not part of this run")
+    if db.scalar(select(Decision.id).where(Decision.run_id == run_id, Decision.area_id == area_id)):
+        raise HTTPException(status_code=409, detail="This recommendation already has a human decision")
     if action == "Modified":
         if allocation is None:
             raise HTTPException(status_code=422, detail="Modified allocation is required")
-        available = {item.resource_key: item.available for item in db.scalars(select(Resource)).all()}
+        available = _available_resource_supply(db)
         for key, count in allocation.items():
             if key not in row["required"] or not isinstance(count, int) or count < 0:
                 raise HTTPException(status_code=422, detail=f"Invalid allocation for {key}")
@@ -467,28 +657,55 @@ def _review(run_id: int, area_id: str, action: str, reason: str | None, allocati
             other_proposals = sum(entry["allocated"].get(key, 0) for entry in run.results.get("results", []) if entry["area_id"] != area_id)
             if count + other_proposals > available.get(key, 0):
                 raise HTTPException(status_code=422, detail=f"Modified allocation for {key} would exceed supply proposed for other areas")
+        area = db.scalar(select(AffectedArea).where(AffectedArea.area_id == area_id))
         row["allocated"] = {**row["allocated"], **allocation}
+        row["allocated_by_center"] = {**row.get("allocated_by_center", {})}
+        for key, count in allocation.items():
+            row["allocated_by_center"][key] = _center_allocation(db, area, key, count)
         row["unmet"] = {key: max(row["required"].get(key, 0)-row["allocated"].get(key, 0), 0) for key in row["required"]}
         run.results = {**run.results, "results": [row if entry["area_id"] == area_id else entry for entry in run.results["results"]]}
     if action in ("Approved", "Modified"):
-        available = {item.resource_key: item.available for item in db.scalars(select(Resource)).all()}
-        prior_approvals = db.scalars(select(Deployment).where(Deployment.run_id == run_id, Deployment.area_id != area_id)).all()
-        committed = {}
-        for item in prior_approvals:
-            committed[item.resource_key] = committed.get(item.resource_key, 0) + item.allocated
-        for key, count in row["allocated"].items():
-            if count + committed.get(key, 0) > available.get(key, 0):
-                raise HTTPException(status_code=422, detail=f"Approval for {key} exceeds currently available supply")
+        distribution = row.get("allocated_by_center", {})
+        # Validate the whole reservation before changing stock.
+        reservations = []
+        for resource_key, count in row["allocated"].items():
+            center_quantities = distribution.get(resource_key) or _center_allocation(
+                db, db.scalar(select(AffectedArea).where(AffectedArea.area_id == area_id)), resource_key, count)
+            if sum(center_quantities.values()) != count:
+                raise HTTPException(status_code=422, detail=f"Center allocations for {resource_key} do not match the approved quantity")
+            for center_id, quantity in center_quantities.items():
+                if center_id == "unassigned":
+                    legacy = db.scalar(select(Resource).where(Resource.resource_key == resource_key))
+                    if legacy is None or legacy.available < quantity:
+                        raise HTTPException(status_code=422, detail=f"Not enough unassigned {resource_key} stock remains")
+                    reservations.append((resource_key, None, quantity, legacy))
+                else:
+                    stock = db.scalar(select(ResourceInventory).where(ResourceInventory.center_id == int(center_id),
+                        ResourceInventory.resource_key == resource_key))
+                    if stock is None:
+                        stock = db.scalar(select(Resource).where(Resource.resource_key == resource_key,
+                            Resource.center_id == int(center_id)))
+                    if stock is None or stock.available < quantity:
+                        raise HTTPException(status_code=422, detail=f"Not enough {resource_key} stock remains at center {center_id}")
+                    reservations.append((resource_key, int(center_id), quantity, stock))
+        for resource_key, center_id, quantity, stock in reservations:
+            stock.available -= quantity
+            stock.allocated += quantity
+            if isinstance(stock, ResourceInventory):
+                stock.quality_status = "reserved_by_approved_recommendation"
+            existing = db.scalar(select(Deployment).where(Deployment.run_id == run_id, Deployment.area_id == area_id,
+                Deployment.resource_key == resource_key, Deployment.center_id == center_id))
+            if existing:
+                existing.allocated += quantity
+            else:
+                db.add(Deployment(run_id=run_id, area_id=area_id, center_id=center_id, resource_key=resource_key,
+                    required=row["required"].get(resource_key, 0), allocated=quantity, status="Approved"))
+        db.flush()
+        from .api_v1 import _sync_legacy_resource_summary
+        for key in row["allocated"]:
+            _sync_legacy_resource_summary(db, key)
     decision = Decision(run_id=run_id, area_id=area_id, decision=action, reason=reason, allocation=allocation, user_id=user.id)
     db.add(decision)
-    if action in ("Approved", "Modified"):
-        approved = row["allocated"]
-        for resource_key, count in approved.items():
-            existing = db.scalar(select(Deployment).where(Deployment.run_id == run_id, Deployment.area_id == area_id, Deployment.resource_key == resource_key))
-            if existing:
-                existing.allocated = count
-            else:
-                db.add(Deployment(run_id=run_id, area_id=area_id, resource_key=resource_key, required=row["required"].get(resource_key, 0), allocated=count, status="Approved"))
     reviewed_ids = set(db.scalars(select(Decision.area_id).where(Decision.run_id == run_id)).all()) | {area_id}
     run.status = "reviewed" if len(reviewed_ids) >= len(run.results.get("results", [])) else "pending_review"
     log_event(db, f"decision.{action.lower()}", f"{action} recommendation for {area_id}", {"run_id": run_id, "reason": reason}, user.id)
@@ -517,7 +734,7 @@ def reject(run_id: int, payload: RejectInput, area_id: str = Query(...), db: Ses
 @app.get("/api/deployments")
 def list_deployments(db: Session = Depends(get_db), _: User = Depends(current_user)):
     areas = {area.area_id: area.name for area in db.scalars(select(AffectedArea)).all()}
-    return [{"id": item.id, "run_id": item.run_id, "area_id": item.area_id, "area_name": areas.get(item.area_id), "resource_key": item.resource_key, "required": item.required, "allocated": item.allocated, "deployed": item.deployed, "remaining": item.allocated-item.deployed, "status": item.status, "updated_at": item.updated_at} for item in db.scalars(select(Deployment).order_by(Deployment.updated_at.desc())).all()]
+    return [{"id": item.id, "run_id": item.run_id, "area_id": item.area_id, "area_name": areas.get(item.area_id), "resource_key": item.resource_key, "center_id": item.center_id, "center_name": item.center.name if item.center else None, "required": item.required, "allocated": item.allocated, "deployed": item.deployed, "remaining": item.allocated-item.deployed, "status": item.status, "updated_at": item.updated_at} for item in db.scalars(select(Deployment).order_by(Deployment.updated_at.desc())).all()]
 
 
 @app.patch("/api/deployments/{deployment_id}")
@@ -527,6 +744,24 @@ def update_deployment(deployment_id: int, payload: DeploymentUpdate, db: Session
         raise HTTPException(status_code=404, detail="Deployment record not found")
     if payload.deployed > item.allocated:
         raise HTTPException(status_code=422, detail="Deployed quantity cannot exceed approved allocation")
+    change = payload.deployed - item.deployed
+    stock = None
+    if item.center_id is not None:
+        stock = db.scalar(select(ResourceInventory).where(ResourceInventory.center_id == item.center_id,
+            ResourceInventory.resource_key == item.resource_key))
+        if stock is None:
+            stock = db.scalar(select(Resource).where(Resource.center_id == item.center_id, Resource.resource_key == item.resource_key))
+    else:
+        stock = db.scalar(select(Resource).where(Resource.resource_key == item.resource_key))
+    if stock is not None:
+        if change > 0 and stock.allocated < change:
+            raise HTTPException(status_code=409, detail="Approved stock is no longer reserved at this center")
+        stock.allocated -= change
+        stock.deployed += change
+        if isinstance(stock, ResourceInventory):
+            stock.quality_status = "manually_updated_deployment"
+            from .api_v1 import _sync_legacy_resource_summary
+            _sync_legacy_resource_summary(db, item.resource_key)
     item.deployed, item.status = payload.deployed, payload.status
     log_event(db, "deployment.updated", f"Updated manual deployment for {item.area_id}", payload.model_dump(), user.id)
     db.commit()
@@ -551,6 +786,57 @@ def update_alert(alert_id: str, payload: AlertUpdate, db: Session = Depends(get_
     log_event(db, "alert.updated", f"Marked alert {alert_id} {'read' if payload.is_read else 'unread'}", {}, user.id)
     db.commit()
     return {"alert_id": alert_id, "is_read": item.is_read}
+
+
+@app.get("/api/disaster-alerts")
+def list_user_disaster_alerts(db: Session = Depends(get_db), _: User = Depends(current_user)):
+    rows = db.scalars(select(UserDisasterAlert).order_by(UserDisasterAlert.timestamp.desc())).all()
+    return [user_disaster_alert_payload(db, row) for row in rows]
+
+
+@app.post("/api/disaster-alerts")
+def create_user_disaster_alert(payload: DisasterAlertCreate, db: Session = Depends(get_db), user: User = Depends(require_roles("Administrator", "Emergency Officer"))):
+    alert = UserDisasterAlert(
+        alert_key=f"DA-{secrets.token_hex(5).upper()}",
+        hazard_category=payload.hazard_category,
+        hazard_type=payload.hazard_type.strip(),
+        title=payload.title.strip(),
+        description=payload.description.strip(),
+        location=payload.location.strip(),
+        severity=payload.severity,
+        created_by=user.id,
+    )
+    db.add(alert)
+    db.flush()
+    # These are in-app department inbox records; no external agency is contacted.
+    db.add_all([DepartmentNotification(alert_id=alert.id, department=name) for name in DEPARTMENTS])
+    category_tasks = TASKS_BY_CATEGORY[payload.hazard_category]
+    if "fire" in payload.hazard_type.lower() or "wildfire" in payload.hazard_type.lower():
+        category_tasks = {**category_tasks, "Environment & Forestry": "Review reported fire extent and environmental impact information."}
+    db.add_all([
+        ResponseTask(alert_id=alert.id, department=department, task=task)
+        for department, task in category_tasks.items()
+    ])
+    add_alert(db, payload.severity, payload.title.strip(), f"{payload.hazard_category} · {payload.hazard_type.strip()} at {payload.location.strip()}: {payload.description.strip()}")
+    log_event(db, "disaster_alert.created", f"Created {payload.hazard_type.strip()} alert {alert.alert_key}", {
+        "hazard_category": payload.hazard_category, "severity": payload.severity,
+        "location": payload.location.strip(), "notified_departments": list(DEPARTMENTS),
+        "assigned_task_count": len(category_tasks),
+    }, user.id)
+    db.commit()
+    db.refresh(alert)
+    return user_disaster_alert_payload(db, alert)
+
+
+@app.patch("/api/disaster-alerts/tasks/{task_id}")
+def update_response_task(task_id: int, payload: ResponseTaskUpdate, db: Session = Depends(get_db), user: User = Depends(require_roles("Administrator", "Emergency Officer"))):
+    task = db.get(ResponseTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Response task not found")
+    task.status = payload.status
+    log_event(db, "disaster_task.updated", f"{task.department} task marked {payload.status}", {"task_id": task.id, "alert_id": task.alert_id}, user.id)
+    db.commit()
+    return {"id": task.id, "status": task.status}
 
 
 @app.get("/api/analytics/overview")
