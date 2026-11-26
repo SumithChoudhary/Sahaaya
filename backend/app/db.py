@@ -16,6 +16,10 @@ class Base(DeclarativeBase):
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./resqai.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgres://")
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgresql://")
 _engine_options = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=_engine_options, pool_pre_ping=True)
 if DATABASE_URL.startswith("sqlite"):

@@ -100,6 +100,16 @@ python -m alembic -c backend/alembic.ini revision --autogenerate -m "describe sc
 
 The app also calls SQLAlchemy `create_all` at startup for an easy local demo bootstrap. Production schema changes should be managed and reviewed through Alembic migrations.
 
+## Demo deployment (Vercel + Render)
+
+The repository includes `vercel.json` for the Vite frontend and `render.yaml` for the FastAPI API plus PostgreSQL. Vercel proxies `/api/*` to `https://sahaaya-api.onrender.com`, so the frontend can keep using the same `/api` base path as local development.
+
+1. Import the GitHub repository into Vercel from [vercel.com/new](https://vercel.com/new). Keep the repository root as the project root; `vercel.json` sets the build command, output directory, API proxy, and React Router fallback.
+2. In Render, create a Blueprint from this repository and the `main` branch. During setup, enter the exact Vercel site origin for `CORS_ORIGINS` and set unique values for `DEMO_USER_PASSWORD`, `DEMO_ADMIN_PASSWORD`, and `DEMO_VIEWER_PASSWORD`. Render generates `JWT_SECRET` and connects the API to the Blueprint's Postgres database.
+3. After both services deploy, open `https://<your-vercel-domain>/api/health`. It should report the API and database as connected. Sign in as `sumith@sahaaya.demo` using the `DEMO_USER_PASSWORD` you set in Render.
+
+This is a free demo configuration. Render's free API can spin down after 15 minutes of inactivity, causing a slow first request, and its free Postgres database expires after 30 days. Do not use this tier for persistent or real emergency operations. See [Render free-tier limits](https://render.com/docs/free), [Vercel rewrites](https://vercel.com/docs/routing/rewrites), and [Render FastAPI deployment](https://render.com/docs/deploy-fastapi).
+
 ## Demo credentials
 
 Default local-only accounts (override passwords in `backend/.env` before first startup):
